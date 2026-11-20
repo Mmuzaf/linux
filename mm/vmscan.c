@@ -5118,6 +5118,38 @@ static bool lru_gen_imbalanced(struct lruvec *lruvec, struct scan_control *sc,
 	return youngest > old * MAX_NR_GENS;
 }
 
+/*
+ * Reclaim does not see accesses to folios in MADV_RANDOM mappings, so
+ * these folios and their refaults go into the oldest generation. If they
+ * fill it as fast as reclaim evicts it, min_seq does not move and reclaim
+ * never reaches the younger generations. Age when the oldest file
+ * generation has refaulted more folios than the file LRU holds. Check
+ * only a full window, where aging moves min_seq and resets the counters.
+ */
+static bool lru_gen_oldest_thrashing(struct lruvec *lruvec, unsigned long max_seq,
+				     unsigned long *min_seq, struct scan_control *sc,
+				     int swappiness)
+{
+	int tier;
+	unsigned long seq, size = 0, refaulted = 0;
+	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+	int hist = lru_hist_from_seq(min_seq[LRU_GEN_FILE]);
+
+	if (swappiness == SWAPPINESS_ANON_ONLY)
+		return false;
+
+	if (min_seq[LRU_GEN_FILE] + MAX_NR_GENS - 1 != max_seq)
+		return false;
+
+	for (tier = 0; tier < MAX_NR_TIERS; tier++)
+		refaulted += atomic_long_read(&lrugen->refaulted[hist][LRU_GEN_FILE][tier]);
+
+	for (seq = min_seq[LRU_GEN_FILE]; seq <= max_seq; seq++)
+		size += lruvec_gen_size(lrugen, LRU_GEN_FILE, seq, sc->reclaim_idx + 1);
+
+	return refaulted > size;
+}
+
 static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 			     struct scan_control *sc, int swappiness)
 {
@@ -5125,6 +5157,10 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 
 	/* have to run aging, since eviction is not possible anymore */
 	if (evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS > max_seq)
+		return true;
+
+	/* the oldest generation refills as fast as reclaim evicts it */
+	if (lru_gen_oldest_thrashing(lruvec, max_seq, min_seq, sc, swappiness))
 		return true;
 
 	/* try to avoid aging, do gentle reclaim at the default priority */
